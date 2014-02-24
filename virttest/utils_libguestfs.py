@@ -5,6 +5,7 @@ libguestfs tools test utility functions.
 import logging
 import signal
 import os
+import re
 
 from autotest.client import os_dep, utils
 from autotest.client.shared import error
@@ -164,7 +165,7 @@ class Guestfish(LibguestfsBase):
 
     def __init__(self, disk_img=None, ro_mode=False,
                  libvirt_domain=None, inspector=False,
-                 uri=None, mount_options=None):
+                 uri=None, mount_options=None, run_mode=None):
         """
         Initialize guestfish command with options.
 
@@ -180,19 +181,22 @@ class Guestfish(LibguestfsBase):
         if lgf_cmd_check(guestfs_exec) is None:
             raise LibguestfsCmdError
 
-        if uri:
-            guestfs_exec += " -c '%s'" % uri
+        if run_mode == "remote":
+            guestfs_exec += " --listen"
+        else:
+            if uri:
+                guestfs_exec += " -c '%s'" % uri
 
-        if disk_img:
-            guestfs_exec += " -a '%s'" % disk_img
-        if libvirt_domain:
-            guestfs_exec += " -d '%s'" % libvirt_domain
-        if ro_mode:
-            guestfs_exec += " --ro"
-        if inspector:
-            guestfs_exec += " -i"
-        if mount_options is not None:
-            guestfs_exec += " --mount %s" % mount_options
+            if disk_img:
+                guestfs_exec += " -a '%s'" % disk_img
+            if libvirt_domain:
+                guestfs_exec += " -d '%s'" % libvirt_domain
+            if ro_mode:
+                guestfs_exec += " --ro"
+            if inspector:
+                guestfs_exec += " -i"
+            if mount_options is not None:
+                guestfs_exec += " --mount %s" % mount_options
 
         super(Guestfish, self).__init__(guestfs_exec)
 
@@ -273,23 +277,101 @@ class GuestfishSession(aexpect.ShellSession):
         return result
 
 
+class GuestfishProcess():
+
+    """
+    A shell session of guestfish.
+    """
+
+    # Check output against list of known error-status strings
+    ERROR_REGEX_LIST = ['libguestfs: error:\s*']
+
+    def __init__(self, guestfs_exec=None, a_id=None):
+        """
+        Initialize guestfish session server, or client if id set.
+
+        :param guestfs_cmd: path to guestfish executable
+        :param id: ID of an already running server, if accessing a running
+                server, or None if starting a new one.
+        :param prompt: Regular expression describing the shell's prompt line.
+        """
+        # aexpect tries to auto close session because no clients connected yet
+        if a_id is None:
+            try:
+                ret = utils.run(guestfs_exec, ignore_status=False,
+                                verbose=True, timeout=60)
+            except error.CmdError, detail:
+                raise LibguestfsCmdError(detail)
+            logging.debug("status: %s", ret.exit_status)
+            logging.debug("stdout: %s", ret.stdout.strip())
+            logging.debug("stderr: %s", ret.stderr.strip())
+            guestfs_exec = ret.stdout.strip()
+            self.a_id = re.search('GUESTFISH_PID=(\d+?); export GUESTFISH_PID', guestfs_exec).group(1)
+        else:
+            self.a_id = a_id
+
+    def get_id(self):
+        return self.a_id
+
+    def cmd_status_output(self, cmd, ignore_status=None, verbose=None, timeout=60):
+        """
+        Send a guestfish command and return its exit status and output.
+
+        :param cmd: guestfish command to send
+                    (must not contain newline characters)
+        :param timeout: The duration (in seconds) to wait for the prompt to
+                return
+        :return: A tuple (status, output) where status is the exit status and
+                output is the output of cmd
+        :raise ShellTimeoutError: Raised if timeout expires
+        :raise ShellProcessTerminatedError: Raised if the shell process
+                terminates while waiting for output
+        :raise ShellStatusError: Raised if the exit status cannot be obtained
+        :raise ShellError: Raised if an unknown error occurs
+        """
+        token = "export GUESTFISH_PID=%s; " % self.a_id
+        guestfs_exec = "guestfish --remote -- "
+        cmd = token + guestfs_exec + cmd
+        try:
+            ret = utils.run(cmd, ignore_status=ignore_status,
+                            verbose=verbose, timeout=timeout)
+        except error.CmdError, detail:
+            raise LibguestfsCmdError(detail)
+        logging.debug("status: %s", ret.exit_status)
+        logging.debug("stderr: %s", ret.stderr.strip())
+        return 0, ret.stdout.strip()
+
+    def cmd_result(self, cmd, ignore_status=False):
+        """Mimic utils.run()"""
+        exit_status, stdout = self.cmd_status_output(cmd)
+        stderr = ''  # no way to retrieve this separately
+        result = utils.CmdResult(cmd, stdout, stderr, exit_status)
+        if not ignore_status and exit_status:
+            raise error.CmdError(cmd, result,
+                                 "Guestfish Command returned non-zero exit status")
+        return result
+
+
 class GuestfishPersistent(Guestfish):
 
     """
     Execute operations using persistent guestfish session.
     """
 
-    __slots__ = ['session_id']
+    __slots__ = ['session_id', 'run_mode']
 
     # Help detect leftover sessions
     SESSION_COUNTER = 0
 
     def __init__(self, disk_img=None, ro_mode=False,
                  libvirt_domain=None, inspector=False,
-                 uri=None, mount_options=None):
+                 uri=None, mount_options=None, run_mode=None):
         super(GuestfishPersistent, self).__init__(disk_img, ro_mode,
                                                   libvirt_domain, inspector,
-                                                  uri, mount_options)
+                                                  uri, mount_options, run_mode)
+
+        self.__dict_set__('run_mode', run_mode)
+
         if self.get('session_id') is None:
             # set_uri does not call when INITIALIZED = False
             # and no session_id passed to super __init__
@@ -297,9 +379,10 @@ class GuestfishPersistent(Guestfish):
 
         # Check whether guestfish session is prepared.
         guestfs_session = self.open_session()
-        if guestfs_session.cmd_status('is-ready', timeout=60) != 0:
-            logging.debug("Persistent guestfish session is not responding.")
-            raise aexpect.ShellStatusError(self.lgf_exec, 'is-ready')
+        if run_mode == "interactive":
+            if guestfs_session.cmd_status('is-ready', timeout=60) != 0:
+                logging.debug("Persistent guestfish session is not responding.")
+                raise aexpect.ShellStatusError(self.lgf_exec, 'is-ready')
 
     def close_session(self):
         """
@@ -307,10 +390,14 @@ class GuestfishPersistent(Guestfish):
         """
         try:
             existing = self.open_session()
+            run_mode = self.get('run_mode')
             # except clause exits function
             # Try to end session with inner command 'quit'
             try:
-                existing.cmd("quit")
+                if run_mode == "remote":
+                    existing.cmd_result("quit")
+                else:
+                    existing.cmd("quit")
                 # It should jump to exception followed normally
             except aexpect.ShellProcessTerminatedError:
                 self.__class__.SESSION_COUNTER -= 1
@@ -318,15 +405,16 @@ class GuestfishPersistent(Guestfish):
                 return  # guestfish session was closed normally
             # Close with 'quit' did not respond
             # So close with aexpect functions
-            if existing.is_alive():
-                # try nicely first
-                existing.close()
+            if run_mode != "remote":
                 if existing.is_alive():
-                    # Be mean, incase it's hung
-                    existing.close(sig=signal.SIGTERM)
-                # Keep count:
-                self.__class__.SESSION_COUNTER -= 1
-                self.__dict_del__('session_id')
+                    # try nicely first
+                    existing.close()
+                    if existing.is_alive():
+                        # Be mean, incase it's hung
+                        existing.close(sig=signal.SIGTERM)
+                    # Keep count:
+                    self.__class__.SESSION_COUNTER -= 1
+                    self.__dict_del__('session_id')
         except LibguestfsCmdError:
             # Allow other exceptions to be raised
             pass  # session was closed already
@@ -340,7 +428,11 @@ class GuestfishPersistent(Guestfish):
         guestfs_exec = self.__dict_get__('lgf_exec')
         self.close_session()
         # Always create new session
-        new_session = GuestfishSession(guestfs_exec)
+        run_mode = self.get('run_mode')
+        if run_mode == "remote":
+            new_session = GuestfishProcess(guestfs_exec)
+        else:
+            new_session = GuestfishSession(guestfs_exec)
         # Keep count
         self.__class__.SESSION_COUNTER += 1
         session_id = new_session.get_id()
@@ -352,9 +444,13 @@ class GuestfishPersistent(Guestfish):
         """
         try:
             session_id = self.__dict_get__('session_id')
+            run_mode = self.get('run_mode')
             if session_id:
                 try:
-                    return GuestfishSession(a_id=session_id)
+                    if run_mode == "remote":
+                        return GuestfishProcess(a_id=session_id)
+                    else:
+                        return GuestfishSession(a_id=session_id)
                 except aexpect.ShellStatusError:
                     # session was already closed
                     self.__dict_del__('session_id')
@@ -514,6 +610,15 @@ class GuestfishPersistent(Guestfish):
         """
         return self.inner_cmd("mountpoints")
 
+    def umount_all(self):
+        """
+        umount-all - unmount all filesystems
+
+        This unmounts all mounted filesystems.
+        Some internal mounts are not unmounted by this call.
+        """
+        return self.inner_cmd("umount-all")
+
     def read_file(self, path):
         """
         read-file - read a file
@@ -649,6 +754,24 @@ class GuestfishPersistent(Guestfish):
         """
         return self.inner_cmd("list-devices")
 
+    def ll(self, directory):
+        """
+        ll - list the files in a directory (long format)
+
+        List the files in "directory" (relative to the root directory, there is
+        no cwd) in the format of 'ls -la'.
+        """
+        return self.inner_cmd("ll %s" % (directory))
+
+    def sync(self):
+        """
+        lsync - sync disks, writes are flushed through to the disk image
+
+        This syncs the disk, so that any writes are flushed through to the
+        underlying disk image.
+        """
+        return self.inner_cmd("sync")
+
     def tar_out(self, directory, tarfile):
         """
         tar-out - pack directory into tarfile
@@ -769,6 +892,15 @@ class GuestfishPersistent(Guestfish):
         """
         return self.inner_cmd("mkfs %s %s" % (fstype, device))
 
+    def mkfs_opts(self, fstype, device, opts):
+        """
+        mkfs-opts - make a filesystem with optional arguments
+
+        This creates a filesystem on "device" (usually a partition or LVM
+        logical volume). The filesystem type is "fstype", for example "ext3".
+        """
+        return self.inner_cmd("mkfs %s %s %s" % (fstype, device, opts))
+
     def part_disk(self, device, parttype):
         """
         part-disk - partition whole disk with a single primary partition
@@ -814,6 +946,15 @@ class GuestfishPersistent(Guestfish):
         filesystem type "fstype".
         """
         return self.inner_cmd("fsck %s %s" % (fstype, device))
+
+    def blockdev_flushbufs(self, device):
+        """
+        blockdev-flushbufs - flush device buffers
+
+        This tells the kernel to flush internal buffers associated with
+        "device".
+        """
+        return self.inner_cmd("blockdev-flushbufs %s" % device)
 
     def blockdev_getss(self, device):
         """
@@ -881,6 +1022,14 @@ class GuestfishPersistent(Guestfish):
         Sets the block device named "device" to read-write.
         """
         return self.inner_cmd("blockdev-setrw %s" % device)
+
+    def pvcreate(self, physvols):
+        """
+        pvcreate - create an LVM physical volume
+
+        This creates an LVM physical volume called "physvols".
+        """
+        return self.inner_cmd("pvcreate %s" % (physvols))
 
     def vgcreate(self, volgroup, physvols):
         """
@@ -967,6 +1116,13 @@ class GuestfishPersistent(Guestfish):
         """
         return self.inner_cmd("lvs")
 
+    def vfs_type(self, mountable):
+        """
+        vfs-type - get the Linux VFS type corresponding to a mounted device
+
+        Gets the filesystem type corresponding to the filesystem on "mountable".
+        """
+        return self.inner_cmd("vfs-type %s" % (mountable))
 
 # libguestfs module functions follow #####
 def libguest_test_tool_cmd(qemuarg=None, qemudirarg=None,
