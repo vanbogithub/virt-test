@@ -337,7 +337,9 @@ class GuestfishProcess():
                             verbose=verbose, timeout=timeout)
         except error.CmdError, detail:
             raise LibguestfsCmdError(detail)
+        logging.debug("command: %s", cmd)
         logging.debug("status: %s", ret.exit_status)
+        logging.debug("stdout: %s", ret.stdout.strip())
         logging.debug("stderr: %s", ret.stderr.strip())
         return 0, ret.stdout.strip()
 
@@ -762,6 +764,16 @@ class GuestfishPersistent(Guestfish):
         no cwd) in the format of 'ls -la'.
         """
         return self.inner_cmd("ll %s" % (directory))
+
+    def touch(self, path):
+        """
+        touch - update file timestamps or create a new file
+
+        Touch acts like the touch(1) command. It can be used to update the
+        timestamps on a file, or, if the file does not exist, to create a new
+        zero-length file.
+        """
+        return self.inner_cmd("touch %s" % (path))
 
     def sync(self):
         """
