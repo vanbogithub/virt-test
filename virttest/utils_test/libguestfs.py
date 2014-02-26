@@ -458,7 +458,8 @@ class GuestfishTools(lgf.GuestfishPersistent):
         run_mode = params.get("guestfs_run_mode", "interactive")
         super(GuestfishTools, self).__init__(disk_img, ro_mode,
                                              libvirt_domain, inspector,
-                                             mount_options=mount_options)
+                                             mount_options=mount_options,
+                                             run_mode=run_mode)
 
     def get_root(self):
         """
@@ -604,6 +605,19 @@ class GuestfishTools(lgf.GuestfishPersistent):
         self.umount_all()
         self.sync()
         return (True, "create_fs successfully")
+
+    def do_mount(self, mountpoint):
+        partition_type = self.params.get("partition_type")
+        if partition_type == "lvm":
+            vg_name = self.params.get("vg_name", "vol_test")
+            lv_name = self.params.get("lv_name", "vol_file")
+            device = "/dev/%s/%s" % (vg_name, lv_name)
+            logging.info("mount lvm partition...%s" % device)
+        elif partition_type == "physical":
+            pv_name = self.params.get("pv_name", "/dev/sda")
+            device = pv_name + "1"
+            logging.info("mount physical partition...%s" % device)
+        self.mount(device, mountpoint)
 
     def create_msdos_part(self, device, start="1", end="-1"):
         """
