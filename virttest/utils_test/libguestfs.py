@@ -39,17 +39,16 @@ def preprocess_image(params):
     partition_type = params.get("partition_type", "lvm")
     fs_type = params.get("fs_type", "ext3")
     img_dir = params.get("img_dir", "/tmp")
-    print(image_format + " " + partition_type + " " + fs_type)
 
     cmd = params.get("create_img_binary", "qemu-img")
     size = params.get("image_size", "6G")
 
     image_name = params.get("image_name", "gs_common")
-    image_filename = '.'.join([i for i in (image_name, fs_type, image_format) if i])
+    image_filename = '.'.join([image_name, image_format])
     image_filename = os.path.join(img_dir, image_filename)
 
     if not image_format in [ "raw", "qcow2"]:
-        logging.error("Won't create image,given format is not supported by guestfish")
+        raise AssertionError("Only raw and qcow2 format is support by libguestfs now")
 
     create_img_cmd = "%s create -f %s %s %s" % (cmd, image_format, image_filename, size)
 
@@ -58,16 +57,15 @@ def preprocess_image(params):
     try:
         ret = utils.run(create_img_cmd, ignore_status=True, verbose=False, timeout=120)
     except error.CmdError, detail:
-        pass
+        error.CmdError(detail, "Create disk image failed")
 
     logging.debug("status: %s", ret.exit_status)
     logging.debug("stdout: %s", ret.stdout.strip())
     logging.debug("stderr: %s", ret.stderr.strip())
 
     if not os.path.exists(image_filename):
-        logging.error("Image could not be created for some reason; "
-                      "img-create command:\n%s" % create_img_cmd)
-        return None
+        raise AssertionError("Image could not be created for some reason; "
+                             "img-create command:\n%s" % create_img_cmd)
 
     logging.info("Image created in %s" % image_filename)
     return image_filename
@@ -553,19 +551,23 @@ class GuestfishTools(lgf.GuestfishPersistent):
         self.add_drive(image_path)
         self.run()
 
-        partition_type = self.params.get("partition_type")
+        partition_type = self.params.get("partition_type", 'lvm')
         fs_type = self.params.get("fs_type", "ext3")
         image_size = self.params.get("image_size", "6G")
         with_blocksize = self.params.get("with_blocksize")
         blocksize = self.params.get("blocksize")
         tarball_path = self.params.get("tarball_path")
+        mount_point = "/"
+
+        if not partition_type in ['lvm', 'physical']:
+            raise AssertionError("Only lvm and physical is support by partition")
 
         if partition_type == "lvm":
             logging.info("create lvm partition...")
             pv_name = self.params.get("pv_name", "/dev/sda")
             vg_name = self.params.get("vg_name", "vol_test")
             lv_name = self.params.get("lv_name", "vol_file")
-            mount_point = "/dev/%s/%s" % (vg_name, lv_name)
+            device_point = "/dev/%s/%s" % (vg_name, lv_name)
             lv_size = int(image_size.replace('G', '')) * 1000
 
             self.pvcreate(pv_name)
@@ -574,33 +576,30 @@ class GuestfishTools(lgf.GuestfishPersistent):
 
         elif partition_type == "physical":
             logging.info("create physical partition...")
-            pv_name = self.params.get("pv_name", "/dev/sda")
-            mount_point = pv_name + "1"
+            device_point = "/dev/sda"
+            pv_name = self.params.get("pv_name", device_point)
+            device_point = pv_name + "1"
 
             self.part_disk(pv_name, "mbr")
             self.part_list(pv_name)
 
-        else:
-            logging.info("no need to create lvm or partition, do nothing")
-
-        if partition_type in ['lvm', 'physical']:
-            if with_blocksize == "yes" and fs_type != "btrfs":
-                if blocksize:
-                    self.mkfs_opts(fs_type, mount_point, "blocksize:%s" % (blocksize))
-                    self.vfs_type(mount_point)
-                else:
-                    logging.error("with_blocksize is set but blocksize not given")
-                    self.umount_all()
-                    self.sync()
-                    return (False, "with_blocksize is set but blocksize not given")
+        if with_blocksize == "yes" and fs_type != "btrfs":
+            if blocksize:
+                self.mkfs_opts(fs_type, device_point, "blocksize:%s" % (blocksize))
+                self.vfs_type(device_point)
             else:
-                self.mkfs(fs_type, mount_point)
-                self.vfs_type(mount_point)
+                logging.error("with_blocksize is set but blocksize not given")
+                self.umount_all()
+                self.sync()
+                return (False, "with_blocksize is set but blocksize not given")
+        else:
+            self.mkfs(fs_type, device_point)
+            self.vfs_type(device_point)
 
-            if tarball_path:
-                self.mount_options("noatime", mount_point, '/')
-                self.tar_in(tarball_path, '/')
-                self.ll('/')
+        if tarball_path:
+            self.mount_options("noatime", device_point, mount_point)
+            self.tar_in(tarball_path, mount_point)
+            self.ll(mount_point)
 
         self.umount_all()
         self.sync()
